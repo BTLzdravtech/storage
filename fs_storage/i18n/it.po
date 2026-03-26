@@ -6,7 +6,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: Odoo Server 16.0\n"
 "Report-Msgid-Bugs-To: \n"
-"PO-Revision-Date: 2025-10-21 08:43+0000\n"
+"PO-Revision-Date: 2026-03-23 10:45+0000\n"
 "Last-Translator: mymage <stefano.consolaro@mymage.it>\n"
 "Language-Team: none\n"
 "Language: it\n"
@@ -14,7 +14,7 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: \n"
 "Plural-Forms: nplurals=2; plural=n != 1;\n"
-"X-Generator: Weblate 5.10.4\n"
+"X-Generator: Weblate 5.15.2\n"
 
 #. module: fs_storage
 #: model_terms:ir.ui.view,arch_db:fs_storage.fs_storage_form_view
@@ -25,6 +25,14 @@ msgstr "Opzioni disponibili"
 #: model:ir.model.fields,field_description:fs_storage.field_fs_storage__options_properties
 msgid "Available properties"
 msgstr "Proprietà disponibili"
+
+#. module: fs_storage
+#. odoo-python
+#: code:addons/fs_storage/models/fs_storage.py:0
+msgid "Calling fs.storage.%(reason)s is not allowed in a safe_eval context."
+msgstr ""
+"La chiamata a fs.storage.%(reason)s non è consentita in un contesto "
+"safe_eval."
 
 #. module: fs_storage
 #: model:ir.model.fields,field_description:fs_storage.field_fs_storage__check_connection_method
@@ -140,8 +148,8 @@ msgstr "Campo"
 msgid ""
 "Field %(field)s already stored in another FS storage ('%(other_storage)s')"
 msgstr ""
-"Il campo %(field)s è già archiviato in un altro deposito FS "
-"('%(other_storage)s')"
+"Il campo %(field)s è già archiviato in un altro deposito FS ('%"
+"(other_storage)s')"
 
 #. module: fs_storage
 #: model:ir.model.fields,field_description:fs_storage.field_fs_storage__field_xmlids
@@ -286,8 +294,8 @@ msgstr "Modello"
 msgid ""
 "Model %(model)s already stored in another FS storage ('%(other_storage)s')"
 msgstr ""
-"Il modello %(model)s è già archiviato in un altro deposito FS "
-"('%(other_storage)s')"
+"Il modello %(model)s è già archiviato in un altro deposito FS ('%"
+"(other_storage)s')"
 
 #. module: fs_storage
 #: model:ir.model.fields,field_description:fs_storage.field_fs_storage__model_xmlids
@@ -400,8 +408,9 @@ msgstr "Deposito"
 msgid ""
 "Technical code used to identify the storage backend into the code.This code "
 "must be unique. This code is used for example to define the storage backend "
-"to store the attachments via the configuration parameter 'ir_attachment."
-"storage.force.database' when the module 'fs_attachment' is installed."
+"to store the attachments via the configuration parameter "
+"'ir_attachment.storage.force.database' when the module 'fs_attachment' is "
+"installed."
 msgstr ""
 "Codice tecnico usato per identificare il backend deposito nel codice. Questo "
 "codice deve essere univoco. Questo codice è utilizzato per esempio per "
