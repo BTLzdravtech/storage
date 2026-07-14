@@ -137,8 +137,20 @@ class IrAttachment(models.Model):
             elif rec.fs_storage_id:
                 rec.fs_storage_id = None
 
-    @staticmethod
-    def _is_storage_disabled(storage=None, log=True):
+    @api.model
+    def _is_storage_disabled(self, storage=None, log=True):
+        """
+        BTL Monkey Patch v19ok
+
+        when loading a huge module that writes own attachments during load, it throws NoCredentialsError.
+        According to Claude it is connected to a known issue with aiobotocore (issues #1219, #1023, #1006).
+        The workaround: enforce storing all attachments during module loads to db, having cron to move
+        certain attachment types to s3 - hopefully will happen only during upgrade
+        """
+        # ------------------------ BTL Monkey Patch - START ------------------------------ #
+        if not self.env.registry.ready:
+            return True
+        # ---------------------------------- END ----------------------------------------- #
         msg = "Storages are disabled (see environment configuration)."
         if storage:
             msg = f"Storage '{storage}' is disabled (see environment configuration)."
@@ -344,8 +356,20 @@ class IrAttachment(models.Model):
 
     @api.model
     def _file_write(self, bin_data, checksum):
+        """
+        BTL Monkey Patch v19ok
+
+        Resolves problem with aiobotocore limitations on big concurrent module update on localhost for s3 credentials.
+        """
         location = self.env.context.get("storage_location") or self._storage()
         if location in self._get_storage_codes():
+            # ------------------------ BTL Monkey Patch - START ------------------------------ #
+            needs_storage = self.env["ir.attachment"].sudo().search_count(
+                [("checksum", "=", checksum), ("store_fname", "!=", False)]
+            )
+            if not needs_storage:
+                return False
+            # ---------------------------------- END ----------------------------------------- #
             filename = self._storage_file_write(bin_data)
         else:
             filename = super()._file_write(bin_data, checksum)
