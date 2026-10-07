@@ -5,7 +5,7 @@
 {
     "name": "Base Attachment Object Store",
     "summary": "Store attachments on external object store",
-    "version": "18.0.2.2.4",
+    "version": "18.0.2.3.0",
     "author": "Camptocamp, ACSONE SA/NV, Odoo Community Association (OCA)",
     "license": "AGPL-3",
     "development_status": "Beta",
@@ -15,6 +15,7 @@
     "data": [
         "security/fs_file_gc.xml",
         "views/fs_storage.xml",
+        "data/ir_cron.xml",
     ],
     "external_dependencies": {"python": ["python_slugify", "fsspec>=2025.3.0"]},
     "installable": True,

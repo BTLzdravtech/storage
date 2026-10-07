@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import mimetypes
 import os
@@ -14,13 +15,12 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 import fsspec  # pylint: disable=missing-manifest-dependency
-import psycopg2
-from slugify import slugify  # pylint: disable=missing-manifest-dependency
-
 import odoo
+import psycopg2
 from odoo import _, api, fields, models
-from odoo.exceptions import AccessError, UserError
+from odoo.exceptions import AccessError, UserError, ValidationError
 from odoo.osv.expression import AND, OR, normalize_domain
+from slugify import slugify  # pylint: disable=missing-manifest-dependency
 
 from .strtobool import strtobool
 
@@ -472,7 +472,6 @@ class IrAttachment(models.Model):
         Keeping the same meaning and mimetype is important to also ease to provide
         a meaningful and SEO friendly URL to the file in the filesystem storage.
         """
-        renamed_attachments = {}
         for attachment in self:
             if not self._is_file_from_a_storage(attachment.store_fname):
                 continue
@@ -486,17 +485,49 @@ class IrAttachment(models.Model):
             new_filename_with_path = os.path.join(
                 os.path.dirname(filename), new_filename
             )
-
-            if filename in renamed_attachments:
-                if renamed_attachments[filename] == new_filename_with_path:
-                    # we already renamed this file, no need to rename it again
-                    continue
-                else:
-                    fs.copy(renamed_attachments[filename], new_filename_with_path)
+            # ------------------------ BTL Monkey Patch - START ------------------------------ #
+            # fs.rename(filename, new_filename_with_path) -> fs.copy with
+            # sibling fallback: batch creates with duplicate SHA1 share one
+            # hash key on S3; the first rename moves it and the next fails.
+            if fs.exists(filename):
+                fs.copy(filename, new_filename_with_path)
+                # rename → copy means the source path is no longer this attachment's home.
+                # GC it: if a sibling (same SHA1) still references it via store_fname, GC
+                # skips; once all siblings move to their new paths, GC removes the orphan.
+                self._fs_mark_for_gc(f"{storage}://{filename}")
             else:
-                fs.rename(filename, new_filename_with_path)
-            renamed_attachments[filename] = new_filename_with_path
-
+                source_found = False
+                siblings = (
+                    self.env["ir.attachment"]
+                    .sudo()
+                    .search(
+                        [
+                            ("checksum", "=", attachment.checksum),
+                            ("id", "!=", attachment.id),
+                            ("store_fname", "=like", f"{storage}://%"),
+                        ],
+                        limit=50,
+                    )
+                )
+                for sib in siblings:
+                    sib_fs, _sib_storage, sib_path = sib._get_fs_parts()
+                    if sib_fs.exists(sib_path):
+                        sib_fs.copy(sib_path, new_filename_with_path)
+                        source_found = True
+                        break
+                if not source_found:
+                    _logger.warning(
+                        "fs_attachment: cannot relocate attachment %s - "
+                        "source %s missing on storage %s and no sibling "
+                        "with checksum %s available; leaving store_fname "
+                        "untouched.",
+                        attachment.id,
+                        filename,
+                        storage,
+                        attachment.checksum,
+                    )
+                    continue
+            # ---------------------------------- END ----------------------------------------- #
             attachment.fs_filename = new_filename
             # we need to update the store_fname with the new filename by
             # calling the write method of the field since the write method
@@ -884,6 +915,121 @@ class IrAttachment(models.Model):
                         # each iteration of the loop. The former issue
                         # being that it reads the content of the file of
                         # ALL the attachments on each loop.
+                        new_env.clear()
+                        attachment = model_env.browse(attachment_id)
+                        path = attachment._move_attachment_to_store()
+                        if path:
+                            files_to_clean.append(path)
+                except psycopg2.OperationalError:
+                    _logger.error(
+                        "Could not migrate attachment %s to S3", attachment_id
+                    )
+
+            # delete the files from the filesystem once we know the changes
+            # have been committed in ir.attachment
+            if files_to_clean:
+                new_env.cr.commit()
+                clean_fs(files_to_clean)
+
+    def delete_filestore_staging(self):
+        """
+        BTL Monkey Patch v18ok
+        """
+        if os.environ.get("ODOO_STAGE") != "staging":
+            return
+        params = self.env["ir.config_parameter"].sudo()
+        size = params.get_param("staging.attachment_delete_size", 5)
+        limit = params.get_param("staging.attachment_delete_limit", 50)
+        domain = [
+            ("file_size", ">", float(size) * 1024 * 1024),
+            ("fs_storage_code", "=", False),
+        ]
+        files_count = self.sudo().search_count(domain)
+        _logger.info("Prepare for delete %s/%s files.", limit, files_count)
+
+        files = self.sudo().search(domain, limit=int(limit), order="file_size desc")
+        for file in files:
+            file_id = file.id
+            try:
+                file.sudo().unlink()
+            except Exception:
+                self.env.cr.execute(
+                    "DELETE FROM ir_attachment WHERE id = %s", (file_id,)
+                )
+        self._gc_file_store()
+
+    @api.model
+    def move_attachments_to_store(
+        self, mimetypes, min_size=False, new_cr=False, limit=10, domain=False
+    ):
+        """Variant of _force_storage_to_object_storage restricted by mimetypes,
+        minimum size and an extra domain, processing at most ``limit`` files."""
+        _logger.info("migrating files to the object storage")
+        storage = self.env.context.get("storage_location") or self._storage()
+        if self._is_storage_disabled(storage):
+            return
+
+        # The weird "res_field = False OR res_field != False" domain
+        # is required! See _force_storage_to_object_storage.
+        base_domain = [
+            "!",
+            ("store_fname", "=like", f"{storage}://%"),
+            "|",
+            ("res_field", "=", False),
+            ("res_field", "!=", False),
+        ]
+
+        if not isinstance(mimetypes, list | tuple):
+            raise ValidationError(self.env._("Invalid format for mimetypes."))
+        base_domain.append(("mimetype", "in", mimetypes))
+
+        if min_size is not False and isinstance(min_size, int):
+            base_domain.append(("file_size", ">=", min_size))
+
+        fs_storage = self.env["fs.storage"].search([("code", "=", storage)])
+        if fs_storage:
+            rules = json.loads(fs_storage.force_db_for_default_attachment_rules)
+            for rule_mimetype, size in rules.items():
+                if any(rule_mimetype in mimetype for mimetype in mimetypes) and (
+                    min_size is False or size > min_size
+                ):
+                    raise ValidationError(
+                        self.env._(
+                            "Parameters are in conflict with the storage "
+                            "configuration (see force db for default attachment "
+                            "rules)."
+                        )
+                    )
+
+        if domain:
+            base_domain.extend(domain)
+
+        # see _force_storage_to_object_storage for the new env / cursor rationale
+        with self._do_in_new_env(new_cr=new_cr) as new_env:
+            model_env = new_env["ir.attachment"]
+            attachments = model_env.search(
+                base_domain, limit=limit, order="file_size desc"
+            )
+            ids = attachments.ids
+            _logger.info(
+                "Prepare for moving %s files with overall size %s MB.",
+                len(ids),
+                sum(attachments.mapped("file_size")) / 1000 / 1000,
+            )
+            files_to_clean = []
+            for attachment_id in ids:
+                try:
+                    with new_env.cr.savepoint():
+                        # check that no other transaction has locked the row,
+                        # don't send a file to storage in that case
+                        self.env.cr.execute(
+                            "SELECT id FROM ir_attachment WHERE id = %s "
+                            "FOR UPDATE NOWAIT",
+                            (attachment_id,),
+                            log_exceptions=False,
+                        )
+                        # avoid recomputing 'datas' of every attachment
+                        # on each iteration of the loop
                         new_env.clear()
                         attachment = model_env.browse(attachment_id)
                         path = attachment._move_attachment_to_store()
