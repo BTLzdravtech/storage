@@ -15,7 +15,6 @@
     "data": [
         "security/fs_file_gc.xml",
         "views/fs_storage.xml",
-        "data/ir_cron.xml",
     ],
     "external_dependencies": {"python": ["python_slugify", "fsspec>=2025.3.0"]},
     "installable": True,
