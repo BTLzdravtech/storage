@@ -2,13 +2,15 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import logging
 import threading
+import time
+from collections import defaultdict
 from contextlib import closing, contextmanager
 
 from odoo import api, fields, models
 from odoo.sql_db import Cursor
 
 _logger = logging.getLogger(__name__)
-
+_GC_ADVISORY_LOCK_KEY = 0x66735F6763
 
 class FsFileGC(models.Model):
     _name = "fs.file.gc"
@@ -64,36 +66,46 @@ class FsFileGC(models.Model):
             # use plain SQL to avoid the ORM ignore conflicts errors
             cr.execute(
                 """
-                INSERT INTO
-                    fs_file_gc (
-                        store_fname,
-                        fs_storage_code,
-                        create_date,
-                        write_date,
-                        create_uid,
-                        write_uid
-                    )
-                    VALUES (
-                        %s,
-                        %s,
-                        now() at time zone 'UTC',
-                        now() at time zone 'UTC',
-                        %s,
-                        %s
-                    )
-                ON CONFLICT DO NOTHING
-            """,
+              INSERT INTO
+                  fs_file_gc (
+                      store_fname,
+                      fs_storage_code,
+                      create_date,
+                      write_date,
+                      create_uid,
+                      write_uid
+                  )
+                  VALUES (
+                      %s,
+                      %s,
+                      now() at time zone 'UTC',
+                      now() at time zone 'UTC',
+                      %s,
+                      %s
+                  )
+              ON CONFLICT DO NOTHING
+          """,
                 (store_fname, code, self.env.uid, self.env.uid),
             )
 
     @api.autovacuum
     def _gc_files(self) -> None:
-        """Garbage collect files"""
+        """Garbage collect files
+
+        Rows are processed by batches, each one in its own transaction: the
+        locks are only held for one batch, and the work done is kept even if
+        the cron is killed before the end of the run.
+        """
         # This method is mainly a copy of the method _gc_file_store_unsafe()
         # from the module fs_attachment. The only difference is that the list
         # of files to delete is retrieved from the table fs_file_gc instead
         # of the odoo filestore.
+        params = self.env["ir.config_parameter"].sudo()
+        batch_size = int(params.get_param("fs_attachment.gc_batch_size", 1000))
+        time_budget = int(params.get_param("fs_attachment.gc_time_budget", 300))
+        deadline = time.monotonic() + time_budget
 
+        cr = self.env.cr
         # Continue in a new transaction. The LOCK statement below must be the
         # first one in the current transaction, otherwise the database snapshot
         # used by it may not contain the most recent changes made to the table
@@ -101,67 +113,87 @@ class FsFileGC(models.Model):
         # the LOCK statement will wait until those concurrent transactions end.
         # But this transaction will not see the new attachements if it has done
         # other requests before the LOCK (like the method _storage() above).
-        cr = self._cr
         cr.commit()  # pylint: disable=invalid-commit
+        while True:
+            # prevent all concurrent updates on ir_attachment and fs_file_gc
+            # while collecting, but only attempt to grab the lock for a little bit,
+            # otherwise it'd start blocking other transactions.
+            # (will be retried later anyway)
+            cr.execute("SET LOCAL lock_timeout TO '10s'")
+            cr.execute("LOCK fs_file_gc IN SHARE MODE")
+            cr.execute("LOCK ir_attachment IN SHARE MODE")
 
-        # prevent all concurrent updates on ir_attachment and fs_file_gc
-        # while collecting, but only attempt to grab the lock for a little bit,
-        # otherwise it'd start blocking other transactions.
-        # (will be retried later anyway)
-        cr.execute("SET LOCAL lock_timeout TO '10s'")
-        cr.execute("LOCK fs_file_gc IN SHARE MODE")
-        cr.execute("LOCK ir_attachment IN SHARE MODE")
+            # the autovacuum and the dedicated cron may run concurrently: both
+            # would collect the same rows and deadlock on the final DELETE.
+            # the transaction (see above).
+            cr.execute("SELECT pg_try_advisory_xact_lock(%s)", (_GC_ADVISORY_LOCK_KEY,))
+            if not cr.fetchone()[0]:
+                cr.rollback()
+                break
 
-        self._gc_files_unsafe()
+            processed = self._gc_files_unsafe(limit=batch_size)
 
-        # commit to release the lock
-        cr.commit()  # pylint: disable=invalid-commit
+            # commit to release the lock and keep the batch done
+            cr.commit()  # pylint: disable=invalid-commit
+            if processed < batch_size or time.monotonic() >= deadline:
+                break
 
-    def _gc_files_unsafe(self) -> None:
+    def _gc_files_unsafe(self, limit=None) -> int:
+        """Remove the files of up to ``limit`` rows of fs_file_gc and delete
+        those rows. Return the number of rows processed."""
         # get the list of fs.storage codes that must be autovacuumed
         codes = (
             self.env["fs.storage"].search([]).filtered("autovacuum_gc").mapped("code")
         )
         if not codes:
-            return
-        # we process by batch of storage codes.
-        self._cr.execute(
+            return 0
+        self.env.cr.execute(
             """
-            SELECT
-                fs_storage_code,
-                array_agg(store_fname)
-
-            FROM
-                fs_file_gc
-            WHERE
-                fs_storage_code IN %s
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM ir_attachment
-                    WHERE store_fname = fs_file_gc.store_fname
-                )
-            GROUP BY
-                fs_storage_code
-            """,
-            (tuple(codes),),
+          SELECT
+              id,
+              fs_storage_code,
+              store_fname,
+              EXISTS (
+                  SELECT 1
+                  FROM ir_attachment
+                  WHERE store_fname = fs_file_gc.store_fname
+              )
+          FROM
+              fs_file_gc
+          WHERE
+              fs_storage_code IN %s
+          ORDER BY
+              id
+          LIMIT %s
+          """,
+            (tuple(codes), limit),
         )
-        for code, store_fnames in self._cr.fetchall():
-            self.env["fs.storage"].get_by_code(code)
-            fs = self.env["fs.storage"].get_fs_by_code(code)
-            for store_fname in store_fnames:
+        rows = self.env.cr.fetchall()
+        if not rows:
+            return 0
+
+        paths_by_code = defaultdict(list)
+        for _gc_id, code, store_fname, still_referenced in rows:
+            if not still_referenced:
+                paths_by_code[code].append(store_fname.partition("://")[2])
+        for code, paths in paths_by_code.items():
+            self._rm_files(self.env["fs.storage"].get_fs_by_code(code), paths)
+
+        self.env.cr.execute(
+            "DELETE FROM fs_file_gc WHERE id IN %s",
+            (tuple(row[0] for row in rows),),
+        )
+        return len(rows)
+
+    def _rm_files(self, fs, paths) -> None:
+        try:
+            # one call for the whole list: s3fs turns it into bulk DeleteObjects
+            fs.rm(paths)
+        except Exception:
+            # the bulk call stops at the first failing path, so the rest of the
+            # list may not have been removed yet
+            for path in paths:
                 try:
-                    file_path = store_fname.partition("://")[2]
-                    fs.rm(file_path)
+                    fs.rm(path)
                 except Exception:
-                    _logger.debug("Failed to remove file %s", store_fname)
-
-        # delete the records from the table fs_file_gc
-        self._cr.execute(
-            """
-            DELETE FROM
-                fs_file_gc
-            WHERE
-                fs_storage_code IN %s
-            """,
-            (tuple(codes),),
-        )
+                    _logger.debug("Failed to remove file %s", path)
